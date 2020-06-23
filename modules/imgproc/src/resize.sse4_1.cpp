@@ -46,7 +46,8 @@
 //  Geometrical transforms on images and matrices: rotation, zoom etc.
 //
 // */
-
+#undef max
+#undef min
 #include "precomp.hpp"
 #include "resize.hpp"
 

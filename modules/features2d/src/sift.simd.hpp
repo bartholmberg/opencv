@@ -68,7 +68,8 @@
 //    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 //    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 \**********************************************************************************************/
-
+#undef max
+#undef min
 #include "precomp.hpp"
 
 #include <opencv2/core/hal/hal.hpp>

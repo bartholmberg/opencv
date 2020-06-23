@@ -738,8 +738,10 @@ inline int hal_ni_minMaxIdx(const uchar* src_data, size_t src_step, int width, i
 #endif
 
 #include "hal_internal.hpp"
-#include "custom_hal.hpp"
-
+//#include "custom_hal.hpp"
+#ifndef _CUSTOM_HAL_INCLUDED_
+#define _CUSTOM_HAL_INCLUDED_
+#endif
 //! @cond IGNORED
 #define CALL_HAL_RET(name, fun, retval, ...) \
 { \
