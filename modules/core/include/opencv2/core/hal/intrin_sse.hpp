@@ -1689,9 +1689,9 @@ inline scalartype v_reduce_##func(const _Tpvec& a) \
 { \
     scalartype CV_DECL_ALIGNED(16) buf[4]; \
     v_store_aligned(buf, a); \
-    scalartype s0 = scalar_func(buf[0], buf[1]); \
-    scalartype s1 = scalar_func(buf[2], buf[3]); \
-    return scalar_func(s0, s1); \
+    scalartype s0 = scalar_func<scalartype>(buf[0], buf[1]); \
+    scalartype s1 = scalar_func<scalartype>(buf[2], buf[3]); \
+    return scalar_func<scalartype>(s0, s1); \
 }
 
 OPENCV_HAL_IMPL_SSE_REDUCE_OP_4_SUM(v_uint32x4, unsigned, __m128i, epi32, OPENCV_HAL_NOP, OPENCV_HAL_NOP, si128_si32)
@@ -1735,7 +1735,7 @@ inline v_float32x4 v_reduce_sum4(const v_float32x4& a, const v_float32x4& b,
     return v_float32x4(_mm_add_ps(_mm_unpacklo_ps(ac, bd), _mm_unpackhi_ps(ac, bd)));
 #endif
 }
-
+//auto b = std::max<unsigned>;
 OPENCV_HAL_IMPL_SSE_REDUCE_OP_4(v_uint32x4, unsigned, max, std::max)
 OPENCV_HAL_IMPL_SSE_REDUCE_OP_4(v_uint32x4, unsigned, min, std::min)
 OPENCV_HAL_IMPL_SSE_REDUCE_OP_4(v_int32x4, int, max, std::max)
