@@ -37,8 +37,7 @@
 // the use of this software, even if advised of the possibility of such damage.
 //
 //M*/
-#undef max
-#undef min
+
 #ifndef __OPENCV_ML_PRECOMP_HPP__
 #define __OPENCV_ML_PRECOMP_HPP__
 
