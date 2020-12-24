@@ -46,11 +46,6 @@
 #include "op_vkcom.hpp"
 #include "op_cuda.hpp"
 
-#ifdef HAVE_CUDA
-#include "cuda4dnn/init.hpp"
-#include "cuda4dnn/primitives/eltwise.hpp" // required by fuseLayers
-#endif
-
 #include "halide_scheduler.hpp"
 
 #include <set>
@@ -66,6 +61,8 @@
 
 #include <opencv2/core/utils/configuration.private.hpp>
 #include <opencv2/core/utils/logger.hpp>
+
+#include <opencv2/core/cuda.hpp>
 
 namespace cv {
 namespace dnn {
@@ -122,8 +119,6 @@ public:
         {
             if (std::string::npos != i->find("MYRIAD") && target == DNN_TARGET_MYRIAD)
                 return true;
-            if (std::string::npos != i->find("HDDL") && target == DNN_TARGET_HDDL)
-                return true;
             else if (std::string::npos != i->find("FPGA") && target == DNN_TARGET_FPGA)
                 return true;
             else if (std::string::npos != i->find("CPU") && target == DNN_TARGET_CPU)
@@ -160,6 +155,23 @@ public:
     }
 #endif
 
+#ifdef HAVE_CUDA
+    static inline bool cudaDeviceSupportsFp16() {
+        if (cv::cuda::getCudaEnabledDeviceCount() <= 0)
+            return false;
+        const int devId = cv::cuda::getDevice();
+        if (devId<0)
+            return false;
+        cv::cuda::DeviceInfo dev_info(devId);
+        if (!dev_info.isCompatible())
+            return false;
+        int version = dev_info.majorVersion() * 10 + dev_info.minorVersion();
+        if (version < 53)
+            return false;
+        return true;
+    }
+#endif
+
 private:
     BackendRegistry()
     {
@@ -186,14 +198,6 @@ private:
 #endif
 #ifdef HAVE_DNN_NGRAPH
             backends.push_back(std::make_pair(DNN_BACKEND_INFERENCE_ENGINE_NGRAPH, DNN_TARGET_MYRIAD));
-#endif
-        }
-        if (checkIETarget(DNN_TARGET_HDDL)) {
-#ifdef HAVE_DNN_IE_NN_BUILDER_2019
-            backends.push_back(std::make_pair(DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019, DNN_TARGET_HDDL));
-#endif
-#ifdef HAVE_DNN_NGRAPH
-            backends.push_back(std::make_pair(DNN_BACKEND_INFERENCE_ENGINE_NGRAPH, DNN_TARGET_HDDL));
 #endif
         }
 #ifdef HAVE_DNN_IE_NN_BUILDER_2019
@@ -239,10 +243,9 @@ private:
 #endif
 
 #ifdef HAVE_CUDA
-        if (haveCUDA() && cuda4dnn::isDeviceCompatible())
-        {
+        if (haveCUDA()) {
             backends.push_back(std::make_pair(DNN_BACKEND_CUDA, DNN_TARGET_CUDA));
-            if (cuda4dnn::doesDeviceSupportFP16())
+            if (cudaDeviceSupportsFp16())
                 backends.push_back(std::make_pair(DNN_BACKEND_CUDA, DNN_TARGET_CUDA_FP16));
         }
 #endif
@@ -581,13 +584,6 @@ struct LayerData
     std::vector<Ptr<BackendWrapper> > outputBlobsWrappers;
     std::vector<Ptr<BackendWrapper> > inputBlobsWrappers;
     std::vector<Ptr<BackendWrapper> > internalBlobsWrappers;
-
-#ifdef HAVE_CUDA
-    /* output ids which must be transferred to the host in the background
-     * after the completion of the forward pass of the layer
-     */
-    std::vector<int> cudaD2HBackgroundTransfers;
-#endif
 
     Ptr<Layer> layerInstance;
     std::vector<Mat> outputBlobs;
@@ -1145,26 +1141,17 @@ static Ptr<BackendWrapper> wrapMat(int backendId, int targetId, cv::Mat& m)
 
 static int g_networkId = 0;
 
-detail::NetImplBase::NetImplBase()
-    : networkId(CV_XADD(&g_networkId, 1))
-    , networkDumpCounter(0)
-    , dumpLevel(DNN_NETWORK_DUMP)
-{
-    // nothing
-}
-
-std::string detail::NetImplBase::getDumpFileNameBase()
-{
-    std::string dumpFileNameBase = cv::format("ocv_dnn_net_%05d_%02d", networkId, networkDumpCounter++);
-    return dumpFileNameBase;
-}
-
-struct Net::Impl : public detail::NetImplBase
+struct Net::Impl
 {
     typedef std::map<int, LayerShapes> LayersShapesMap;
     typedef std::map<int, LayerData> MapIdToLayerData;
 
+    const int networkId; // network global identifier
+    int networkDumpCounter; // dump counter
+
     Impl()
+        : networkId(CV_XADD(&g_networkId, 1))
+        , networkDumpCounter(0)
     {
         //allocate fake net input layer
         netInputLayer = Ptr<DataLayer>(new DataLayer());
@@ -1182,7 +1169,18 @@ struct Net::Impl : public detail::NetImplBase
         preferableBackend = DNN_BACKEND_DEFAULT;
         preferableTarget = DNN_TARGET_CPU;
         skipInfEngineInit = false;
-        hasDynamicShapes = false;
+
+#ifdef HAVE_CUDA
+        if (cv::cuda::getCudaEnabledDeviceCount() > 0)
+        {
+            cuda4dnn::csl::CSLContext context;
+            context.stream = cuda4dnn::csl::Stream(true);
+            context.cublas_handle = cuda4dnn::csl::cublas::Handle(context.stream);
+            context.cudnn_handle = cuda4dnn::csl::cudnn::Handle(context.stream);
+
+            cudaInfo = std::unique_ptr<CudaInfo_t>(new CudaInfo_t(std::move(context)));
+        }
+#endif
     }
 
     Ptr<DataLayer> netInputLayer;
@@ -1194,7 +1192,6 @@ struct Net::Impl : public detail::NetImplBase
     int preferableTarget;
     String halideConfigFile;
     bool skipInfEngineInit;
-    bool hasDynamicShapes;
     // Map host data to backend specific wrapper.
     std::map<void*, Ptr<BackendWrapper> > backendWrappers;
 
@@ -1209,10 +1206,8 @@ struct Net::Impl : public detail::NetImplBase
 #ifdef HAVE_CUDA
     struct CudaInfo_t
     {
-        CudaInfo_t(cuda4dnn::csl::CSLContext ctxt, cuda4dnn::csl::Stream d2h_stream_)
-         : context(std::move(ctxt)), d2h_stream(std::move(d2h_stream_)) { }
+        CudaInfo_t(cuda4dnn::csl::CSLContext ctxt) : context(std::move(ctxt)) { }
         cuda4dnn::csl::CSLContext context;
-        cuda4dnn::csl::Stream d2h_stream;
         cuda4dnn::csl::Workspace workspace;
     };
 
@@ -1364,7 +1359,7 @@ struct Net::Impl : public detail::NetImplBase
     {
         CV_TRACE_FUNCTION();
 
-        if (dumpLevel && networkDumpCounter == 0)
+        if (DNN_NETWORK_DUMP > 0 && networkDumpCounter == 0)
         {
             dumpNetworkToFile();
         }
@@ -1391,7 +1386,6 @@ struct Net::Impl : public detail::NetImplBase
                   preferableTarget == DNN_TARGET_OPENCL ||
                   preferableTarget == DNN_TARGET_OPENCL_FP16 ||
                   preferableTarget == DNN_TARGET_MYRIAD ||
-                  preferableTarget == DNN_TARGET_HDDL ||
                   preferableTarget == DNN_TARGET_FPGA
             );
         }
@@ -1469,7 +1463,7 @@ struct Net::Impl : public detail::NetImplBase
 
             netWasAllocated = true;
 
-            if (dumpLevel)
+            if (DNN_NETWORK_DUMP > 0)
             {
                 dumpNetworkToFile();
             }
@@ -1598,9 +1592,7 @@ struct Net::Impl : public detail::NetImplBase
     {
         CV_TRACE_FUNCTION();
         if (preferableBackend == DNN_BACKEND_OPENCV)
-        {
             CV_Assert(preferableTarget == DNN_TARGET_CPU || IS_DNN_OPENCL_TARGET(preferableTarget));
-        }
         else if (preferableBackend == DNN_BACKEND_HALIDE)
             initHalideBackend();
         else if (preferableBackend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019)
@@ -1622,7 +1614,7 @@ struct Net::Impl : public detail::NetImplBase
         else if (preferableBackend == DNN_BACKEND_VKCOM)
             initVkComBackend();
         else if (preferableBackend == DNN_BACKEND_CUDA)
-            initCUDABackend(blobsToKeep_);
+            initCUDABackend();
         else
             CV_Error(Error::StsNotImplemented, "Unknown backend identifier");
     }
@@ -1765,7 +1757,6 @@ struct Net::Impl : public detail::NetImplBase
 
             Ptr<InfEngineBackendNode> ieNode = node.dynamicCast<InfEngineBackendNode>();
             CV_Assert(!ieNode.empty());
-            ieNode->net->reset();
 
             for (it = layers.begin(); it != layers.end(); ++it)
             {
@@ -1826,7 +1817,7 @@ struct Net::Impl : public detail::NetImplBase
                                     INF_ENGINE_VER_MAJOR_GE(INF_ENGINE_RELEASE_2019R2) &&
                                     supportsCPUFallback;
                 // TODO: there is a bug in Myriad plugin with custom layers shape infer.
-                if (preferableTarget == DNN_TARGET_MYRIAD || preferableTarget == DNN_TARGET_HDDL)
+                if (preferableTarget == DNN_TARGET_MYRIAD)
                 {
                     for (int i = 0; customizable && i < ld.inputBlobs.size(); ++i)
                     {
@@ -1836,7 +1827,6 @@ struct Net::Impl : public detail::NetImplBase
 
                 // TODO: fix these workarounds
                 if (preferableTarget == DNN_TARGET_MYRIAD ||
-                    preferableTarget == DNN_TARGET_HDDL ||
                     preferableTarget == DNN_TARGET_OPENCL ||
                     preferableTarget == DNN_TARGET_OPENCL_FP16)
                     customizable &= ld.type != "Concat";
@@ -1924,7 +1914,6 @@ struct Net::Impl : public detail::NetImplBase
             // Convert weights in FP16 for specific targets.
             if ((preferableTarget == DNN_TARGET_OPENCL_FP16 ||
                  preferableTarget == DNN_TARGET_MYRIAD ||
-                 preferableTarget == DNN_TARGET_HDDL ||
                  preferableTarget == DNN_TARGET_FPGA) && !fused)
             {
 #if INF_ENGINE_VER_MAJOR_GE(INF_ENGINE_RELEASE_2019R1)
@@ -2069,7 +2058,6 @@ struct Net::Impl : public detail::NetImplBase
 
             Ptr<InfEngineNgraphNode> ieNode = node.dynamicCast<InfEngineNgraphNode>();
             CV_Assert(!ieNode.empty());
-            ieNode->net->reset();
 
             for (it = layers.begin(); it != layers.end(); ++it)
             {
@@ -2119,7 +2107,7 @@ struct Net::Impl : public detail::NetImplBase
                 bool customizable = ld.id != 0 && supportsCPUFallback;
 
                 // TODO: there is a bug in Myriad plugin with custom layers shape infer.
-                if (preferableTarget == DNN_TARGET_MYRIAD || preferableTarget == DNN_TARGET_HDDL)
+                if (preferableTarget == DNN_TARGET_MYRIAD)
                 {
                     for (int i = 0; customizable && i < ld.inputBlobs.size(); ++i)
                     {
@@ -2129,7 +2117,6 @@ struct Net::Impl : public detail::NetImplBase
 
                 // TODO: fix these workarounds
                 if (preferableTarget == DNN_TARGET_MYRIAD ||
-                    preferableTarget == DNN_TARGET_HDDL ||
                     preferableTarget == DNN_TARGET_OPENCL ||
                     preferableTarget == DNN_TARGET_OPENCL_FP16)
                     customizable &= ld.type != "Concat";
@@ -2153,7 +2140,6 @@ struct Net::Impl : public detail::NetImplBase
                         Ptr<BackendNode> inpNode = inpLd.backendNodes[preferableBackend];
                         if (!inpNode.empty()) {
                             Ptr<InfEngineNgraphNode> ieNode = inpNode.dynamicCast<InfEngineNgraphNode>();
-                            CV_Assert(!ieNode.empty());
                             ieNode->net->setUnconnectedNodes(ieNode);
                         }
                     }
@@ -2183,7 +2169,7 @@ struct Net::Impl : public detail::NetImplBase
                 }
 
                 if (net.empty()) {
-                    net = Ptr<InfEngineNgraphNet>(new InfEngineNgraphNet(*this));
+                    net = Ptr<InfEngineNgraphNet>(new InfEngineNgraphNet());
                 }
 
                 if (!fused) {
@@ -2198,7 +2184,6 @@ struct Net::Impl : public detail::NetImplBase
                         int cons_inp = cons->oid;
                         Ptr<NgraphBackendWrapper> inpWrapper = inpLd.outputBlobsWrappers[cons_inp].
                                                                      dynamicCast<NgraphBackendWrapper>();
-                        CV_Assert(!inpWrapper.empty());
                         auto iter = std::find(inputNames.begin(), inputNames.end(),
                                               inpWrapper->dataPtr->getName());
                         if (iter == inputNames.end()) {
@@ -2228,7 +2213,7 @@ struct Net::Impl : public detail::NetImplBase
                 }
             }
             else {
-                net = Ptr<InfEngineNgraphNet>(new InfEngineNgraphNet(*this));
+                net = Ptr<InfEngineNgraphNet>(new InfEngineNgraphNet());
             }
 
             if (!fused)
@@ -2243,9 +2228,7 @@ struct Net::Impl : public detail::NetImplBase
 
                     auto ieInpNode = inputNodes[i].dynamicCast<InfEngineNgraphNode>();
                     CV_Assert(oid < ieInpNode->node->get_output_size());
-#if INF_ENGINE_VER_MAJOR_GT(INF_ENGINE_RELEASE_2020_4)
-                    inputNodes[i] = Ptr<BackendNode>(new InfEngineNgraphNode(ieInpNode->node));
-#elif INF_ENGINE_VER_MAJOR_GT(INF_ENGINE_RELEASE_2020_3)
+#if INF_ENGINE_VER_MAJOR_GT(2020030000)
                     inputNodes[i] = Ptr<BackendNode>(new InfEngineNgraphNode(ieInpNode->node->get_output_as_single_output_node(oid)));
 #else
                     inputNodes[i] = Ptr<BackendNode>(new InfEngineNgraphNode(ieInpNode->node->get_output_as_single_output_node(oid, false)));
@@ -2357,57 +2340,10 @@ struct Net::Impl : public detail::NetImplBase
 #endif
     }
 
-    void initCUDABackend(const std::vector<LayerPin>& blobsToKeep_)
-    {
+    void initCUDABackend() {
         CV_Assert(haveCUDA());
-        CV_Assert(preferableBackend == DNN_BACKEND_CUDA);
 
 #ifdef HAVE_CUDA
-        if (cuda4dnn::getDeviceCount() <= 0)
-            CV_Error(Error::StsError, "No CUDA capable device found.");
-
-        if (cuda4dnn::getDevice() < 0)
-            CV_Error(Error::StsError, "No CUDA capable device selected.");
-
-        if (!cuda4dnn::isDeviceCompatible())
-            CV_Error(Error::GpuNotSupported, "OpenCV was not built to work with the selected device. Please check CUDA_ARCH_PTX or CUDA_ARCH_BIN in your build configuration.");
-
-        if (preferableTarget == DNN_TARGET_CUDA_FP16 && !cuda4dnn::doesDeviceSupportFP16())
-            CV_Error(Error::StsError, "The selected CUDA device does not support FP16 operations.");
-
-        if (!cudaInfo)
-        {
-            cuda4dnn::csl::CSLContext context;
-            context.stream = cuda4dnn::csl::Stream(true);
-            context.cublas_handle = cuda4dnn::csl::cublas::Handle(context.stream);
-            context.cudnn_handle = cuda4dnn::csl::cudnn::Handle(context.stream);
-
-            auto d2h_stream = cuda4dnn::csl::Stream(true); // stream for background D2H data transfers
-            cudaInfo = std::unique_ptr<CudaInfo_t>(new CudaInfo_t(std::move(context), std::move(d2h_stream)));
-            cuda4dnn::checkVersions();
-        }
-
-        cudaInfo->workspace = cuda4dnn::csl::Workspace(); // release workspace memory if any
-
-        for (auto& layer : layers)
-        {
-            auto& ld = layer.second;
-            if (ld.id == 0)
-            {
-                for (auto& wrapper : ld.inputBlobsWrappers)
-                {
-                    auto cudaWrapper = wrapper.dynamicCast<CUDABackendWrapper>();
-                    cudaWrapper->setStream(cudaInfo->context.stream, cudaInfo->d2h_stream);
-                }
-            }
-
-            for (auto& wrapper : ld.outputBlobsWrappers)
-            {
-                auto cudaWrapper = wrapper.dynamicCast<CUDABackendWrapper>();
-                cudaWrapper->setStream(cudaInfo->context.stream, cudaInfo->d2h_stream);
-            }
-        }
-
         for (auto& layer : layers)
         {
             auto& ld = layer.second;
@@ -2429,15 +2365,6 @@ struct Net::Impl : public detail::NetImplBase
 
             auto cudaNode = node.dynamicCast<CUDABackendNode>();
             cudaInfo->workspace.require(cudaNode->get_workspace_memory_in_bytes());
-        }
-
-        if (blobsToKeep_.size() > 1)
-        {
-            for (const auto& pin : blobsToKeep_)
-            {
-                LayerData& ld = layers[pin.lid];
-                ld.cudaD2HBackgroundTransfers.push_back(pin.oid);
-            }
         }
 #endif
     }
@@ -2485,7 +2412,16 @@ struct Net::Impl : public detail::NetImplBase
             ninputs = netInputLayer->inputsData.size();
             ld.inputBlobsWrappers.resize(ninputs);
             for (size_t i = 0; i < ninputs; i++)
+            {
                 ld.inputBlobsWrappers[i] = wrap(netInputLayer->inputsData[i]);
+#ifdef HAVE_CUDA
+                if (IS_DNN_CUDA_TARGET(preferableTarget))
+                {
+                    auto wrapper = ld.inputBlobsWrappers[i].dynamicCast<CUDABackendWrapper>();
+                    wrapper->setStream(cudaInfo->context.stream);
+                }
+#endif
+            }
         }
         else
         {
@@ -2511,12 +2447,23 @@ struct Net::Impl : public detail::NetImplBase
                                           preferableTarget == DNN_TARGET_OPENCL_FP16);
         ld.outputBlobsWrappers.resize(ld.outputBlobs.size());
         for (int i = 0; i < ld.outputBlobs.size(); ++i)
+        {
             ld.outputBlobsWrappers[i] = wrap(ld.outputBlobs[i]);
+#ifdef HAVE_CUDA
+            if (IS_DNN_CUDA_TARGET(preferableTarget))
+            {
+                auto wrapper = ld.outputBlobsWrappers[i].dynamicCast<CUDABackendWrapper>();
+                wrapper->setStream(cudaInfo->context.stream);
+            }
+#endif
+        }
 
         /* CUDA backend has its own system for internal blobs; we don't need these */
         ld.internalBlobsWrappers.resize((preferableBackend == DNN_BACKEND_CUDA) ? 0 : ld.internals.size());
         for (int i = 0; i < ld.internalBlobsWrappers.size(); ++i)
+        {
             ld.internalBlobsWrappers[i] = wrap(ld.internals[i]);
+        }
 
         Ptr<Layer> layerPtr = ld.getLayerInstance();
         {
@@ -2588,11 +2535,6 @@ struct Net::Impl : public detail::NetImplBase
                 LayerPin lpNext(ld.consumers[0].lid, 0);
                 while (nextData)
                 {
-                    /* we use `tryFuse` member of convolution layer to fuse eltwise later
-                     * it's not intended to be fused here; hence, we stop when we encounter eltwise
-                     */
-                    if (preferableBackend == DNN_BACKEND_CUDA && ld.type == "Convolution" && nextData->type == "Eltwise")
-                        break;
                     Ptr<Layer> nextLayer = nextData->layerInstance;
                     if (currLayer->tryFuse(nextLayer))
                     {
@@ -2668,63 +2610,15 @@ struct Net::Impl : public detail::NetImplBase
                         break;
                 }
 
-                // OpenCL: fuse convolution layer followed by eltwise + relu
-                // CUDA: fuse convolution layer followed by eltwise (and optional activation)
-                while (nextData &&
-                    (IS_DNN_OPENCL_TARGET(preferableTarget) || IS_DNN_CUDA_TARGET(preferableTarget)) &&
-                    ld.layerInstance->type == "Convolution"
-                )  // semantic of 'if'
+                // fuse convolution layer followed by eltwise + relu
+                if ( IS_DNN_OPENCL_TARGET(preferableTarget) && ld.layerInstance->type == "Convolution" )
                 {
-                    Ptr<EltwiseLayer> nextEltwiseLayer = nextData->layerInstance.dynamicCast<EltwiseLayer>();
-                    if (nextEltwiseLayer.empty())
-                        break;
+                    Ptr<EltwiseLayer> nextEltwiseLayer;
+                    if( nextData )
+                        nextEltwiseLayer = nextData->layerInstance.dynamicCast<EltwiseLayer>();
 
-#ifdef HAVE_CUDA
-                    // CUDA backend supports fusion with eltwise sum (without variable channels)
-                    // `nextEltwiseLayer` is reset if eltwise layer doesn't have a compatible configuration for fusion
-                    if (IS_DNN_CUDA_TARGET(preferableTarget) && !nextEltwiseLayer.empty())
-                    {
-                        // we create a temporary backend node for eltwise layer to obtain the eltwise configuration
-                        cuda4dnn::csl::CSLContext context; // assume that initCUDA and EltwiseOp do not use the context during init
-                        const auto node = nextData->layerInstance->initCUDA(&context, nextData->inputBlobsWrappers, nextData->outputBlobsWrappers);
-                        const auto eltwiseNode = node.dynamicCast<cuda4dnn::EltwiseOpBase>();
-                        // CUDA backend uses EltwiseOp when all operands have the same number of channels; otherwise, ShortcutOp is used.
-                        // Hence, a successful cast to EltwiseOp implies that the number of channels is same in all operand tensors.
-                        if (eltwiseNode.empty() || eltwiseNode->op != cuda4dnn::EltwiseOpType::SUM || !eltwiseNode->coeffs.empty())
-                            nextEltwiseLayer = Ptr<EltwiseLayer>();
-                    }
-#endif
-
-                    if (pinsToKeep.count(lpNext) != 0)
-                        break;
-                    if (nextData->inputBlobsId.size() != 2)
-                        break;
-
-                    if (!nextData->params.has("operation") || toLowerCase(nextData->params.get<String>("operation")) == "sum")
-                    {
-                        if (nextData->params.has("coeff"))
-                        {
-                            DictValue paramCoeff = nextData->params.get("coeff");
-                            int n = paramCoeff.size();
-                            bool isCoeffOneOne = (n == 2);
-                            for (int i = 0; isCoeffOneOne && i < n; i++)
-                            {
-                                float c = paramCoeff.get<float>(i);
-                                isCoeffOneOne &= (c == 1.0f);
-                            }
-                            if (!isCoeffOneOne)
-                            {
-                                CV_LOG_DEBUG(NULL, "DNN/OpenCL: fusion of 'Sum' without coeffs (or {1.0, 1.0}) is supported only");
-                                break;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        CV_LOG_DEBUG(NULL, "DNN/OpenCL: fusion with eltwise operation is not supported: " << nextData->params.get<String>("operation"));
-                        break;
-                    }
-
+                    if( !nextEltwiseLayer.empty() && pinsToKeep.count(lpNext) == 0 &&
+                        nextData && nextData->inputBlobsId.size() == 2 )
                     {
                         LayerData *eltwiseData = nextData;
 
@@ -2753,165 +2647,65 @@ struct Net::Impl : public detail::NetImplBase
                         }
                         CV_Assert(biasLayerData);
                         {
-                            // fuse eltwise + activation layer
-                            // bias must already be computed to fuse => bias layer must appear before convolution
-                            if (biasLayerData->id < ld.id)
+                            if( eltwiseData->consumers.size() == 1 )
                             {
-                                /* we can fuse activation if:
-                                 * => activation layer that follows is the only consumer of eltwise output
-                                 * => activation layer does not process multiple inputs
-                                 * => we do not require to keep the output of eltwise
-                                 */
-                                Ptr<ActivationLayer> nextFusabeleActivLayer;
-                                if (eltwiseData->consumers.size() == 1 && pinsToKeep.count(lpNext) == 0)
+                                // fuse eltwise + activation layer
+                                if (biasLayerData->id < ld.id)
                                 {
                                     nextData = &layers[eltwiseData->consumers[0].lid];
                                     lpNext = LayerPin(eltwiseData->consumers[0].lid, 0);
-                                    CV_Assert(nextData);
-                                    if (nextData->outputBlobs.size() == 1)
-                                        nextFusabeleActivLayer = nextData->layerInstance.dynamicCast<ActivationLayer>();
-                                }
-                                else
-                                {
-                                    // OCL backend cannot fuse in this case but the CUDA backend can continue with just eltwise
-                                    nextData = 0;
-                                }
+                                    Ptr<ActivationLayer> nextActivLayer;
+                                    if( nextData )
+                                        nextActivLayer = nextData->layerInstance.dynamicCast<ActivationLayer>();
 
-                                // the requirements of OCV OpenCL backend and CUDA backend are different
-                                // we need to check them separately; hence, the fuse variables
-                                bool fuse_eltwise = false, fuse_activation = false;
-
-                                Ptr<PowerLayer> activ_power;
-                                if (IS_DNN_OPENCL_TARGET(preferableTarget) && !nextFusabeleActivLayer.empty() &&
-                                    nextData &&
-                                    (!nextData->type.compare("ReLU") ||
-                                     !nextData->type.compare("ChannelsPReLU") ||
-                                     (!nextData->type.compare("Power") && (activ_power = nextFusabeleActivLayer.dynamicCast<PowerLayer>()) && activ_power->scale == 1.0f)
-                                    ) &&
-                                    currLayer->setActivation(nextFusabeleActivLayer))
-                                {
-                                    fuse_eltwise = true;
-                                    fuse_activation = true;
-                                }
-
-                                if (IS_DNN_CUDA_TARGET(preferableTarget))
-                                {
-                                    /* supported fusion options:
-                                     * => convolution + eltwise
-                                     * => activation(convolution) + eltwise
-                                     *    > convolution + activation would have been fused already; we have to fuse eltwise
-                                     * => activation(convolution + eltwise)
-                                     *    > fuse eltwise and then activation
-                                     */
-                                    auto layer = nextEltwiseLayer.staticCast<Layer>();
-                                    if (currLayer->tryFuse(layer))
+                                    if( !nextActivLayer.empty() && pinsToKeep.count(lpNext) == 0 &&
+                                            (!nextData->type.compare("ReLU") ||
+                                             !nextData->type.compare("ChannelsPReLU") ||
+                                             !nextData->type.compare("Power")) &&
+                                            currLayer->setActivation(nextActivLayer) )
                                     {
-                                        fuse_eltwise = true; /* eltwise was successfully fused */
-                                        if (!nextFusabeleActivLayer.empty() && nextData)
+                                        CV_Assert_N(biasLayerData->outputBlobsWrappers.size() == 1, ld.inputBlobsWrappers.size() == 1);
+                                        ld.inputBlobsWrappers.push_back(biasLayerData->outputBlobsWrappers[0]);
+                                        printf_(("\tfused with %s\n", nextEltwiseLayer->name.c_str()));
+                                        printf_(("\tfused with %s\n", nextActivLayer->name.c_str()));
+                                        eltwiseData->skip = true;
+                                        nextData->skip = true;
+                                        // This optimization for cases like
+                                        // some_layer   conv
+                                        //   |             |
+                                        //   +-- eltwise --+
+                                        //          |
+                                        //        activ
+                                        // This way all the element-wise computations
+                                        // (i.e. some_layer+conv or some_layer*conv)
+                                        // would be done at [conv] layer. So we need to
+                                        // replace [conv]'s output blob to [eltwise]'s one
+                                        // considering that [activ] is an in-place layer.
+                                        // Also we need to move all the consumers' references.
+                                        // To prevent memory collisions (i.e. when input of
+                                        // [conv] and output of [eltwise] is the same blob)
+                                        // we allocate a new blob.
+                                        CV_Assert_N(ld.outputBlobs.size() == 1, ld.outputBlobsWrappers.size() == 1);
+                                        ld.outputBlobs[0] = ld.outputBlobs[0].clone();
+                                        ld.outputBlobsWrappers[0] = wrap(ld.outputBlobs[0]);
+
+                                        eltwiseData->outputBlobs = ld.outputBlobs;
+                                        nextData->outputBlobs = ld.outputBlobs;
+                                        eltwiseData->outputBlobsWrappers = ld.outputBlobsWrappers;
+                                        nextData->outputBlobsWrappers = ld.outputBlobsWrappers;
+
+                                        // Move references of [activ] layer consumers to the newly allocated blob.
+                                        for (int i = 0; i < nextData->consumers.size(); ++i)
                                         {
-                                            if ((!nextData->type.compare("ReLU") ||
-                                                 !nextData->type.compare("ReLU6") ||
-                                                 !nextData->type.compare("Power") ||
-                                                 !nextData->type.compare("TanH") ||
-                                                 !nextData->type.compare("Sigmoid") ||
-                                                 !nextData->type.compare("Swish") ||
-                                                 !nextData->type.compare("Mish")) &&
-                                                currLayer->setActivation(nextFusabeleActivLayer))
+                                            LayerData& consumer = layers[nextData->consumers[i].lid];
+                                            for (int j = 0; j < consumer.inputBlobsId.size(); ++j)
                                             {
-                                                // activation was fused
-                                                fuse_activation = true;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                CV_Assert(!fuse_activation || fuse_eltwise); /* cannot fuse activation without eltwise */
-                                if(fuse_eltwise && fuse_activation)
-                                {
-                                    CV_Assert(nextData);
-                                    CV_Assert_N(biasLayerData->outputBlobsWrappers.size() == 1, ld.inputBlobsWrappers.size() == 1);
-                                    ld.inputBlobsWrappers.push_back(biasLayerData->outputBlobsWrappers[0]);
-                                    printf_(("\tfused with %s\n", nextEltwiseLayer->name.c_str()));
-                                    printf_(("\tfused with %s\n", nextFusabeleActivLayer->name.c_str()));
-                                    eltwiseData->skip = true;
-                                    nextData->skip = true;
-                                    // This optimization for cases like
-                                    // some_layer   conv
-                                    //   |             |
-                                    //   +-- eltwise --+
-                                    //          |
-                                    //        activ
-                                    // This way all the element-wise computations
-                                    // (i.e. some_layer+conv or some_layer*conv)
-                                    // would be done at [conv] layer. So we need to
-                                    // replace [conv]'s output blob to [eltwise]'s one
-                                    // considering that [activ] is an in-place layer.
-                                    // Also we need to move all the consumers' references.
-                                    // To prevent memory collisions (i.e. when input of
-                                    // [conv] and output of [eltwise] is the same blob)
-                                    // we allocate a new blob.
-                                    CV_Assert_N(ld.outputBlobs.size() == 1, ld.outputBlobsWrappers.size() == 1);
-                                    ld.outputBlobs[0] = ld.outputBlobs[0].clone();
-                                    ld.outputBlobsWrappers[0] = wrap(ld.outputBlobs[0]);
-
-                                    eltwiseData->outputBlobs = ld.outputBlobs;
-                                    nextData->outputBlobs = ld.outputBlobs;
-                                    eltwiseData->outputBlobsWrappers = ld.outputBlobsWrappers;
-                                    nextData->outputBlobsWrappers = ld.outputBlobsWrappers;
-
-                                    // Move references of [activ] layer consumers to the newly allocated blob.
-                                    for (int i = 0; i < nextData->consumers.size(); ++i)
-                                    {
-                                        LayerData& consumer = layers[nextData->consumers[i].lid];
-                                        for (int j = 0; j < consumer.inputBlobsId.size(); ++j)
-                                        {
-                                            if (consumer.inputBlobsId[j].lid == lpNext.lid)
-                                            {
-                                                consumer.inputBlobs[j] = &ld.outputBlobs[0];
-                                                consumer.inputBlobsWrappers[j] = ld.outputBlobsWrappers[0];
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                else if (fuse_eltwise) // conv + eltwise (note: conv could have fused activations before eltwise)
-                                {
-                                    CV_Assert(IS_DNN_CUDA_TARGET(preferableTarget));
-                                    CV_Assert_N(biasLayerData->outputBlobsWrappers.size() == 1, ld.inputBlobsWrappers.size() == 1);
-                                    ld.inputBlobsWrappers.push_back(biasLayerData->outputBlobsWrappers[0]);
-                                    printf_(("\tfused with %s\n", nextEltwiseLayer->name.c_str()));
-                                    eltwiseData->skip = true;
-                                    // This optimization is for cases like
-                                    // some_layer   conv (maybe fused with activ)
-                                    //   |             |
-                                    //   +-- eltwise --+
-                                    //
-                                    // This way all the element-wise computations
-                                    // (i.e. some_layer+conv or some_layer*conv)
-                                    // would be done at [conv] layer. So we need to
-                                    // replace [conv]'s output blob to [eltwise]'s one.
-                                    // Also we need to move all the consumers' references.
-                                    // To prevent memory collisions (i.e. when input of
-                                    // [conv] and output of [eltwise] is the same blob)
-                                    // we allocate a new blob.
-                                    CV_Assert_N(ld.outputBlobs.size() == 1, ld.outputBlobsWrappers.size() == 1);
-                                    ld.outputBlobs[0] = ld.outputBlobs[0].clone();
-                                    ld.outputBlobsWrappers[0] = wrap(ld.outputBlobs[0]);
-
-                                    eltwiseData->outputBlobs = ld.outputBlobs;
-                                    eltwiseData->outputBlobsWrappers = ld.outputBlobsWrappers;
-
-                                    // Move references of [eltwise] layer consumers to the newly allocated blob.
-                                    for (int i = 0; i < eltwiseData->consumers.size(); ++i)
-                                    {
-                                        LayerData& consumer = layers[eltwiseData->consumers[i].lid];
-                                        for (int j = 0; j < consumer.inputBlobsId.size(); ++j)
-                                        {
-                                            if (consumer.inputBlobsId[j].lid == eltwiseData->id)
-                                            {
-                                                consumer.inputBlobs[j] = &ld.outputBlobs[0];
-                                                consumer.inputBlobsWrappers[j] = ld.outputBlobsWrappers[0];
-                                                break;
+                                                if (consumer.inputBlobsId[j].lid == lpNext.lid)
+                                                {
+                                                    consumer.inputBlobs[j] = &ld.outputBlobs[0];
+                                                    consumer.inputBlobsWrappers[j] = ld.outputBlobsWrappers[0];
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -2919,8 +2713,6 @@ struct Net::Impl : public detail::NetImplBase
                             }
                         }
                     }
-
-                    break;
                 }
             }
 
@@ -2933,7 +2725,8 @@ struct Net::Impl : public detail::NetImplBase
             // (and so we eliminate the concatenation layer, because the channels
             // are concatenated implicitly).
             Ptr<ConcatLayer> concatLayer = ld.layerInstance.dynamicCast<ConcatLayer>();
-            if( !concatLayer.empty() && !concatLayer->padding && ld.outputBlobs.size() == 1 )
+            if( !concatLayer.empty() && concatLayer->axis == 1 && !concatLayer->padding &&
+                ld.outputBlobs.size() == 1 )
             {
                 Mat& output = ld.outputBlobs[0];
                 UMat umat_output;
@@ -2970,8 +2763,7 @@ struct Net::Impl : public detail::NetImplBase
                 // the concatenation optimization is applied with batch_size > 1.
                 // so, for now, we only apply this optimization in the most popular
                 // case batch_size == 1.
-                int axis = clamp(concatLayer->axis, output.dims);
-                if( output.total(0, axis) == 1 )
+                if( output.dims == 4 && output.size[0] == 1 )
                 {
                     size_t i, ninputs = ld.inputBlobsId.size();
                     std::vector<LayerPin> realinputs(ninputs);
@@ -2996,13 +2788,7 @@ struct Net::Impl : public detail::NetImplBase
                         if (preferableBackend == DNN_BACKEND_CUDA &&
                             (inp_i_data->layerInstance->supportBackend(DNN_BACKEND_CUDA) == false ||
                              (inp_i_data->layerInstance->type != "Convolution" &&
-                              inp_i_data->layerInstance->type != "Pooling" &&
-                              inp_i_data->layerInstance->type != "Resize"  &&
-                              inp_i_data->layerInstance->type != "Flatten" &&
-                              inp_i_data->layerInstance->type != "Permute" &&
-                              inp_i_data->layerInstance->type != "Reorg" &&
-                              inp_i_data->layerInstance->type != "Eltwise" &&
-                              inp_i_data->layerInstance.dynamicCast<ActivationLayer>().empty())))
+                              inp_i_data->layerInstance->type != "Pooling")))
                         {
                             break;
                         }
@@ -3025,19 +2811,18 @@ struct Net::Impl : public detail::NetImplBase
                             OpenCLBackendWrapper::update(ld.outputBlobsWrappers, umats);
                         }
 #endif
-
 #ifdef HAVE_CUDA
                         if (preferableBackend == DNN_BACKEND_CUDA)
                             ld.outputBlobsWrappers[0] = wrap(output);
 #endif
-                        std::vector<Range> chrange(output.dims, Range::all());
+                        Range chrange[] = { Range::all(), Range::all(), Range::all(), Range::all() };
                         int ofs = 0;
                         for( i = 0; i < ninputs; i++ )
                         {
                             LayerPin pin = realinputs[i];
                             LayerData* inp_i_data = &layers[pin.lid];
-                            int channels_i = ld.inputBlobs[i]->size[axis];
-                            chrange[axis] = Range(ofs, ofs + channels_i);
+                            int channels_i = ld.inputBlobs[i]->size[1];
+                            chrange[1] = Range(ofs, ofs + channels_i);
                             printf_(("\toutput %s(%d) to channels (%d, %d)\n", inp_i_data->layerInstance->name.c_str(),
                                    pin.oid, ofs, ofs + channels_i));
                             ofs += channels_i;
@@ -3058,9 +2843,9 @@ struct Net::Impl : public detail::NetImplBase
                             if (preferableBackend == DNN_BACKEND_CUDA)
                             {
                                 auto cuda_wrapper = wrap(output).dynamicCast<CUDABackendWrapper>();
-                                auto offset = chrange[axis].start * output_slice.total(axis + 1, output.dims);
-                                auto new_shape = shape(output_slice);
-                                cuda_wrapper->update(new_shape, offset);
+                                auto offset = chrange[1].start * (output.size[2] * output.size[3]);
+                                auto shape = MatShape{1, chrange[1].size(), output.size[2], output.size[3]};
+                                cuda_wrapper->update(shape, offset);
                                 inp_i_data->outputBlobsWrappers[pin.oid] = cuda_wrapper.staticCast<BackendWrapper>();
                             }
 #endif
@@ -3160,11 +2945,11 @@ struct Net::Impl : public detail::NetImplBase
 
         Ptr<Layer> layer = ld.layerInstance;
 
+        TickMeter tm;
+        tm.start();
+
         if( !ld.skip )
         {
-            TickMeter tm;
-            tm.start();
-
             std::map<int, Ptr<BackendNode> >::iterator it = ld.backendNodes.find(preferableBackend);
             if (preferableBackend == DNN_BACKEND_OPENCV || it == ld.backendNodes.end() || it->second.empty())
             {
@@ -3335,12 +3120,6 @@ struct Net::Impl : public detail::NetImplBase
                     CV_Assert(!cudaNode.empty());
 
                     cudaNode->forward(ld.inputBlobsWrappers, ld.outputBlobsWrappers, cudaInfo->workspace);
-
-                    for (auto id : ld.cudaD2HBackgroundTransfers)
-                    {
-                        auto wrapper = ld.outputBlobsWrappers[id].dynamicCast<CUDABackendWrapper>();
-                        wrapper->copyToHostInBackground();
-                    }
 #endif
                 }
                 else if (preferableBackend == DNN_BACKEND_HALIDE)
@@ -3373,15 +3152,12 @@ struct Net::Impl : public detail::NetImplBase
                     CV_Error(Error::StsNotImplemented, "Unknown backend identifier");
                 }
             }
-
-            tm.stop();
-            int64 t = tm.getTimeTicks();
-            layersTimings[ld.id] = (t > 0) ? t : t + 1;  // zero for skipped layers only
         }
         else
-        {
-            layersTimings[ld.id] = 0;
-        }
+            tm.reset();
+
+        tm.stop();
+        layersTimings[ld.id] = tm.getTimeTicks();
 
         ld.flag = 1;
     }
@@ -3541,46 +3317,6 @@ struct Net::Impl : public detail::NetImplBase
         shapes = inOutShapes[layerId];
     }
 
-    void updateLayersShapes()
-    {
-        CV_Assert(!layers[0].outputBlobs.empty());
-        ShapesVec inputShapes;
-        for(int i = 0; i < layers[0].outputBlobs.size(); i++)
-        {
-            Mat& inp = layers[0].outputBlobs[i];
-            CV_Assert(inp.total());
-            if (preferableBackend == DNN_BACKEND_OPENCV &&
-                preferableTarget == DNN_TARGET_OPENCL_FP16)
-            {
-                layers[0].outputBlobs[i].create(inp.dims, inp.size, CV_16S);
-            }
-            inputShapes.push_back(shape(inp));
-        }
-        LayersShapesMap layersShapes;
-        layersShapes[0].in = inputShapes;
-        for (MapIdToLayerData::iterator it = layers.begin();
-             it != layers.end(); it++)
-        {
-            int layerId = it->first;
-            std::vector<LayerPin>& inputLayerIds = it->second.inputBlobsId;
-            if (layersShapes[layerId].in.empty())
-            {
-                for(int i = 0; i < inputLayerIds.size(); i++)
-                {
-                    int inputLayerId = inputLayerIds[i].lid;
-                    LayersShapesMap::iterator inputIt = layersShapes.find(inputLayerId);
-                    if(inputIt == layersShapes.end() || inputIt->second.out.empty())
-                    {
-                        getLayerShapesRecursively(inputLayerId, layersShapes);
-                    }
-                    const MatShape& shape = layersShapes[inputLayerId].out[inputLayerIds[i].oid];
-                    layersShapes[layerId].in.push_back(shape);
-                }
-                it->second.layerInstance->updateMemoryShapes(layersShapes[layerId].in);
-            }
-        }
-    }
-
     LayerPin getLatestLayerPin(const std::vector<LayerPin>& pins)
     {
         return *std::max_element(pins.begin(), pins.end());
@@ -3681,8 +3417,7 @@ struct Net::Impl : public detail::NetImplBase
     void dumpNetworkToFile()
     {
 #ifndef OPENCV_DNN_DISABLE_NETWORK_AUTO_DUMP
-        string dumpFileNameBase = getDumpFileNameBase();
-        string dumpFileName = dumpFileNameBase + ".dot";
+        String dumpFileName = cv::format("ocv_dnn_net_%05d_%02d.dot", networkId, networkDumpCounter++);
         try
         {
             string dumpStr = dump();
@@ -3741,7 +3476,7 @@ Net Net::Impl::createNetworkFromModelOptimizer(InferenceEngine::CNNNetwork& ieNe
     {
         auto fake_node = std::make_shared<ngraph::op::Parameter>(ngraph::element::f32, ngraph::Shape{});
         Ptr<InfEngineNgraphNode> backendNodeNGraph(new InfEngineNgraphNode(fake_node));
-        backendNodeNGraph->net = Ptr<InfEngineNgraphNet>(new InfEngineNgraphNet(*(cvNet.impl), ieNet));
+        backendNodeNGraph->net = Ptr<InfEngineNgraphNet>(new InfEngineNgraphNet(ieNet));
         backendNode = backendNodeNGraph;
     }
     else
@@ -3774,7 +3509,6 @@ Net Net::Impl::createNetworkFromModelOptimizer(InferenceEngine::CNNNetwork& ieNe
     for (auto& it : ieNet.getOutputsInfo())
     {
         CV_TRACE_REGION("output");
-        const auto& outputName = it.first;
 
         LayerParams lp;
         int lid = cvNet.addLayer(it.first, "", lp);
@@ -3784,65 +3518,37 @@ Net Net::Impl::createNetworkFromModelOptimizer(InferenceEngine::CNNNetwork& ieNe
 #ifdef HAVE_DNN_NGRAPH
         if (DNN_BACKEND_INFERENCE_ENGINE_NGRAPH == getInferenceEngineBackendTypeParam())
         {
+            const auto& outputName = it.first;
             Ptr<Layer> cvLayer(new NgraphBackendLayer(ieNet));
             cvLayer->name = outputName;
             cvLayer->type = "_unknown_";
 
-            auto process_layer = [&](const std::string& name) -> bool
+            if (ngraphFunction)
             {
-                if (ngraphFunction)
+                CV_TRACE_REGION("ngraph_function");
+                bool found = false;
+                for (const auto& op : ngraphOperations)
                 {
-                    CV_TRACE_REGION("ngraph_function");
-                    for (const auto& op : ngraphOperations)
+                    CV_Assert(op);
+                    if (op->get_friendly_name() == outputName)
                     {
-                        CV_Assert(op);
-                        if (op->get_friendly_name() == name)
-                        {
-                            const std::string typeName = op->get_type_info().name;
-                            cvLayer->type = typeName;
-                            return true;
-                        }
+                        const std::string typeName = op->get_type_info().name;
+                        cvLayer->type = typeName;
+                        found = true;
+                        break;
                     }
-                    return false;
                 }
-                else
-                {
-#if INF_ENGINE_VER_MAJOR_GT(INF_ENGINE_RELEASE_2020_4)
-                    CV_Error(Error::StsNotImplemented, "This OpenCV version is built with Inference Engine which has dropped IR v7 support");
-#else
-                    CV_TRACE_REGION("legacy_cnn_layer");
-                    try
-                    {
-                        InferenceEngine::CNNLayerPtr ieLayer = ieNet.getLayerByName(name.c_str());
-                        CV_Assert(ieLayer);
-
-                        cvLayer->type = ieLayer->type;
-                        return true;
-                    }
-                    catch (const std::exception& e)
-                    {
-                        CV_UNUSED(e);
-                        CV_LOG_DEBUG(NULL, "IE layer extraction failure: '" << name << "' - " << e.what());
-                        return false;
-                    }
-#endif
-
-                }
-            };
-
-            bool found = process_layer(outputName);
-            if (!found)
-            {
-                auto pos = outputName.rfind('.');  // cut port number: ".0"
-                if (pos != std::string::npos)
-                {
-                    std::string layerName = outputName.substr(0, pos);
-                    found = process_layer(layerName);
-                }
+                if (!found)
+                    CV_LOG_WARNING(NULL, "DNN/IE: Can't determine output layer type: '" << outputName << "'");
             }
-            if (!found)
-                CV_LOG_WARNING(NULL, "DNN/IE: Can't determine output layer type: '" << outputName << "'");
+            else
+            {
+                CV_TRACE_REGION("legacy_cnn_layer");
+                InferenceEngine::CNNLayerPtr ieLayer = ieNet.getLayerByName(it.first.c_str());
+                CV_Assert(ieLayer);
 
+                cvLayer->type = ieLayer->type;
+            }
             ld.layerInstance = cvLayer;
             ld.backendNodes[DNN_BACKEND_INFERENCE_ENGINE_NGRAPH] = backendNode;
         }
@@ -3852,23 +3558,10 @@ Net Net::Impl::createNetworkFromModelOptimizer(InferenceEngine::CNNNetwork& ieNe
 #ifdef HAVE_DNN_IE_NN_BUILDER_2019
             Ptr<Layer> cvLayer(new InfEngineBackendLayer(ieNet));
 
-            InferenceEngine::CNNLayerPtr ieLayer;
-            try
-            {
-                ieLayer = ieNet.getLayerByName(outputName.c_str());
-            }
-            catch (...)
-            {
-                auto pos = outputName.rfind('.');  // cut port number: ".0"
-                if (pos != std::string::npos)
-                {
-                    std::string layerName = outputName.substr(0, pos);
-                    ieLayer = ieNet.getLayerByName(layerName.c_str());
-                }
-            }
+            InferenceEngine::CNNLayerPtr ieLayer = ieNet.getLayerByName(it.first.c_str());
             CV_Assert(ieLayer);
 
-            cvLayer->name = outputName;
+            cvLayer->name = it.first;
             cvLayer->type = ieLayer->type;
             ld.layerInstance = cvLayer;
 
@@ -3994,8 +3687,6 @@ int Net::addLayer(const String &name, const String &type, LayerParams &params)
     int id = ++impl->lastLayerId;
     impl->layerNameToId.insert(std::make_pair(name, id));
     impl->layers.insert(std::make_pair(id, LayerData(id, name, type, params)));
-    if (params.get<bool>("has_dynamic_shapes", false))
-        impl->hasDynamicShapes = true;
 
     return id;
 }
@@ -4032,16 +3723,11 @@ void Net::connect(String _outPin, String _inPin)
 Mat Net::forward(const String& outputName)
 {
     CV_TRACE_FUNCTION();
-    CV_Assert(!empty());
 
     String layerName = outputName;
 
     if (layerName.empty())
-    {
-        std::vector<String> layerNames = getLayerNames();
-        CV_Assert(!layerNames.empty());
-        layerName = layerNames.back();
-    }
+        layerName = getLayerNames().back();
 
     std::vector<LayerPin> pins(1, impl->getPinByAlias(layerName));
     impl->setUpNet(pins);
@@ -4053,17 +3739,11 @@ Mat Net::forward(const String& outputName)
 AsyncArray Net::forwardAsync(const String& outputName)
 {
     CV_TRACE_FUNCTION();
-    CV_Assert(!empty());
-
 #ifdef CV_CXX11
     String layerName = outputName;
 
     if (layerName.empty())
-    {
-        std::vector<String> layerNames = getLayerNames();
-        CV_Assert(!layerNames.empty());
-        layerName = layerNames.back();
-    }
+        layerName = getLayerNames().back();
 
     std::vector<LayerPin> pins(1, impl->getPinByAlias(layerName));
     impl->setUpNet(pins);
@@ -4084,16 +3764,11 @@ AsyncArray Net::forwardAsync(const String& outputName)
 void Net::forward(OutputArrayOfArrays outputBlobs, const String& outputName)
 {
     CV_TRACE_FUNCTION();
-    CV_Assert(!empty());
 
     String layerName = outputName;
 
     if (layerName.empty())
-    {
-        std::vector<String> layerNames = getLayerNames();
-        CV_Assert(!layerNames.empty());
-        layerName = layerNames.back();
-    }
+        layerName = getLayerNames().back();
 
     std::vector<LayerPin> pins(1, impl->getPinByAlias(layerName));
     impl->setUpNet(pins);
@@ -4327,13 +4002,8 @@ void Net::setInput(InputArray blob, const String& name, double scalefactor, cons
     bool oldShape = prevShape == blobShape;
 
     blob_.copyTo(impl->netInputLayer->inputsData[pin.oid]);
-    if (!oldShape) {
+    if (!oldShape)
         ld.outputBlobs[pin.oid] = impl->netInputLayer->inputsData[pin.oid];
-        if (impl->hasDynamicShapes)
-        {
-            impl->updateLayersShapes();
-        }
-    }
 
     if (!ld.outputBlobsWrappers[pin.oid].empty())
     {
@@ -4604,7 +4274,6 @@ string Net::Impl::dump()
             case DNN_TARGET_OPENCL: out << "OCL"; colorId = 1; break;
             case DNN_TARGET_OPENCL_FP16: out << "OCL_FP16"; colorId = 2; break;
             case DNN_TARGET_MYRIAD: out << "MYRIAD"; colorId = 3; break;
-            case DNN_TARGET_HDDL: out << "HDDL"; colorId = 8; break;
             case DNN_TARGET_VULKAN: out << "VULKAN"; colorId = 7; break;
             case DNN_TARGET_FPGA: out << "FPGA"; colorId = 4; break;
             case DNN_TARGET_CUDA: out << "CUDA"; colorId = 5; break;
@@ -4691,8 +4360,6 @@ std::vector<Ptr<Layer> > Net::getLayerInputs(LayerId layerId)
 
 std::vector<String> Net::getLayerNames() const
 {
-    CV_TRACE_FUNCTION();
-
     std::vector<String> res;
     res.reserve(impl->layers.size());
 
@@ -5283,10 +4950,6 @@ bool Layer::getMemoryShapes(const std::vector<MatShape> &inputs,
     return false;
 }
 
-bool Layer::updateMemoryShapes(const std::vector<MatShape> &inputs)
-{
-    return true;
-}
 //////////////////////////////////////////////////////////////////////////
 
 static Mutex& getLayerFactoryMutex()
@@ -5330,15 +4993,16 @@ void LayerFactory::registerLayer(const String &type, Constructor constructor)
     CV_TRACE_ARG_VALUE(type, "type", type.c_str());
 
     cv::AutoLock lock(getLayerFactoryMutex());
-    LayerFactory_Impl::iterator it = getLayerFactoryImpl().find(type);
+    String type_ = toLowerCase(type);
+    LayerFactory_Impl::iterator it = getLayerFactoryImpl().find(type_);
 
     if (it != getLayerFactoryImpl().end())
     {
         if (it->second.back() == constructor)
-            CV_Error(cv::Error::StsBadArg, "Layer \"" + type + "\" already was registered");
+            CV_Error(cv::Error::StsBadArg, "Layer \"" + type_ + "\" already was registered");
         it->second.push_back(constructor);
     }
-    getLayerFactoryImpl().insert(std::make_pair(type, std::vector<Constructor>(1, constructor)));
+    getLayerFactoryImpl().insert(std::make_pair(type_, std::vector<Constructor>(1, constructor)));
 }
 
 void LayerFactory::unregisterLayer(const String &type)
@@ -5347,8 +5011,9 @@ void LayerFactory::unregisterLayer(const String &type)
     CV_TRACE_ARG_VALUE(type, "type", type.c_str());
 
     cv::AutoLock lock(getLayerFactoryMutex());
+    String type_ = toLowerCase(type);
 
-    LayerFactory_Impl::iterator it = getLayerFactoryImpl().find(type);
+    LayerFactory_Impl::iterator it = getLayerFactoryImpl().find(type_);
     if (it != getLayerFactoryImpl().end())
     {
         if (it->second.size() > 1)
@@ -5364,7 +5029,8 @@ Ptr<Layer> LayerFactory::createLayerInstance(const String &type, LayerParams& pa
     CV_TRACE_ARG_VALUE(type, "type", type.c_str());
 
     cv::AutoLock lock(getLayerFactoryMutex());
-    LayerFactory_Impl::const_iterator it = getLayerFactoryImpl().find(type);
+    String type_ = toLowerCase(type);
+    LayerFactory_Impl::const_iterator it = getLayerFactoryImpl().find(type_);
 
     if (it != getLayerFactoryImpl().end())
     {

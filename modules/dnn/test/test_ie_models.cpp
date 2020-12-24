@@ -73,8 +73,7 @@ struct OpenVINOModelTestCaseInfo
 static const std::map<std::string, OpenVINOModelTestCaseInfo>& getOpenVINOTestModels()
 {
     static std::map<std::string, OpenVINOModelTestCaseInfo> g_models {
-#if INF_ENGINE_RELEASE >= 2018050000 && \
-    INF_ENGINE_RELEASE <= 2020999999  // don't use IRv5 models with 2020.1+
+#if INF_ENGINE_RELEASE >= 2018050000
         // layout is defined by open_model_zoo/model_downloader
         // Downloaded using these parameters for Open Model Zoo downloader (2019R1):
         // ./downloader.py -o ${OPENCV_DNN_TEST_DATA_PATH}/omz_intel_models --cache_dir ${OPENCV_DNN_TEST_DATA_PATH}/.omz_cache/ \
@@ -103,14 +102,10 @@ static const std::map<std::string, OpenVINOModelTestCaseInfo>& getOpenVINOTestMo
 #if INF_ENGINE_RELEASE >= 2020010000
         // Downloaded using these parameters for Open Model Zoo downloader (2020.1):
         // ./downloader.py -o ${OPENCV_DNN_TEST_DATA_PATH}/omz_intel_models --cache_dir ${OPENCV_DNN_TEST_DATA_PATH}/.omz_cache/ \
-        //     --name person-detection-retail-0013,age-gender-recognition-retail-0013
+        //     --name person-detection-retail-0013
         { "person-detection-retail-0013", {  // IRv10
             "intel/person-detection-retail-0013/FP32/person-detection-retail-0013",
             "intel/person-detection-retail-0013/FP16/person-detection-retail-0013"
-        }},
-        { "age-gender-recognition-retail-0013", {
-            "intel/age-gender-recognition-retail-0013/FP16/age-gender-recognition-retail-0013",
-            "intel/age-gender-recognition-retail-0013/FP32/age-gender-recognition-retail-0013"
         }},
 #endif
     };
@@ -127,21 +122,6 @@ static const std::vector<std::string> getOpenVINOTestModelsList()
     return result;
 }
 
-inline static std::string getOpenVINOModel(const std::string &modelName, bool isFP16)
-{
-    const std::map<std::string, OpenVINOModelTestCaseInfo>& models = getOpenVINOTestModels();
-    const auto it = models.find(modelName);
-    if (it != models.end())
-    {
-        OpenVINOModelTestCaseInfo modelInfo = it->second;
-        if (isFP16 && modelInfo.modelPathFP16)
-            return std::string(modelInfo.modelPathFP16);
-        else if (!isFP16 && modelInfo.modelPathFP32)
-            return std::string(modelInfo.modelPathFP32);
-    }
-    return std::string();
-}
-
 static inline void genData(const InferenceEngine::TensorDesc& desc, Mat& m, Blob::Ptr& dataPtr)
 {
     const std::vector<size_t>& dims = desc.getDims();
@@ -154,7 +134,11 @@ static inline void genData(const InferenceEngine::TensorDesc& desc, Mat& m, Blob
 void runIE(Target target, const std::string& xmlPath, const std::string& binPath,
            std::map<std::string, cv::Mat>& inputsMap, std::map<std::string, cv::Mat>& outputsMap)
 {
-    SCOPED_TRACE("runIE");
+    CNNNetReader reader;
+    reader.ReadNetwork(xmlPath);
+    reader.ReadWeights(binPath);
+
+    CNNNetwork net = reader.getNetwork();
 
     std::string device_name;
 
@@ -164,17 +148,6 @@ void runIE(Target target, const std::string& xmlPath, const std::string& binPath
     InferenceEnginePluginPtr enginePtr;
     InferencePlugin plugin;
 #endif
-
-#if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_GT(2019030000)
-    CNNNetwork net = ie.ReadNetwork(xmlPath, binPath);
-#else
-    CNNNetReader reader;
-    reader.ReadNetwork(xmlPath);
-    reader.ReadWeights(binPath);
-
-    CNNNetwork net = reader.getNetwork();
-#endif
-
     ExecutableNetwork netExec;
     InferRequest infRequest;
 
@@ -274,8 +247,6 @@ void runCV(Backend backendId, Target targetId, const std::string& xmlPath, const
            const std::map<std::string, cv::Mat>& inputsMap,
            std::map<std::string, cv::Mat>& outputsMap)
 {
-    SCOPED_TRACE("runOCV");
-
     Net net = readNet(xmlPath, binPath);
     for (auto& it : inputsMap)
         net.setInput(it.second, it.first);
@@ -315,11 +286,6 @@ TEST_P(DNNTestOpenVINO, models)
     }
 #endif
 
-#if INF_ENGINE_VER_MAJOR_EQ(2020040000)
-    if (targetId == DNN_TARGET_MYRIAD && modelName == "person-detection-retail-0002")  // IRv5, OpenVINO 2020.4 regression
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_MYRIAD, CV_TEST_TAG_DNN_SKIP_IE_NGRAPH, CV_TEST_TAG_DNN_SKIP_IE_VERSION);
-#endif
-
     if (backendId == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019)
         setInferenceEngineBackendType(CV_DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_API);
     else if (backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
@@ -329,8 +295,11 @@ TEST_P(DNNTestOpenVINO, models)
 
     bool isFP16 = (targetId == DNN_TARGET_OPENCL_FP16 || targetId == DNN_TARGET_MYRIAD);
 
-    const std::string modelPath = getOpenVINOModel(modelName, isFP16);
-    ASSERT_FALSE(modelPath.empty()) << modelName;
+    const std::map<std::string, OpenVINOModelTestCaseInfo>& models = getOpenVINOTestModels();
+    const auto it = models.find(modelName);
+    ASSERT_TRUE(it != models.end()) << modelName;
+    OpenVINOModelTestCaseInfo modelInfo = it->second;
+    std::string modelPath = isFP16 ? modelInfo.modelPathFP16 : modelInfo.modelPathFP32;
 
     std::string xmlPath = findDataFile(modelPath + ".xml", false);
     std::string binPath = findDataFile(modelPath + ".bin", false);
@@ -340,10 +309,8 @@ TEST_P(DNNTestOpenVINO, models)
     // Single Myriad device cannot be shared across multiple processes.
     if (targetId == DNN_TARGET_MYRIAD)
         resetMyriadDevice();
-    if (targetId == DNN_TARGET_HDDL)
-        releaseHDDLPlugin();
-    EXPECT_NO_THROW(runIE(targetId, xmlPath, binPath, inputsMap, ieOutputsMap)) << "runIE";
-    EXPECT_NO_THROW(runCV(backendId, targetId, xmlPath, binPath, inputsMap, cvOutputsMap)) << "runCV";
+    runIE(targetId, xmlPath, binPath, inputsMap, ieOutputsMap);
+    runCV(backendId, targetId, xmlPath, binPath, inputsMap, cvOutputsMap);
 
     double eps = 0;
 #if INF_ENGINE_VER_MAJOR_GE(2020010000)
@@ -376,9 +343,10 @@ TEST_P(DNNTestHighLevelAPI, predict)
 
     Target target = (dnn::Target)(int)GetParam();
     bool isFP16 = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD);
-    const std::string modelName = "age-gender-recognition-retail-0013";
-    const std::string modelPath = getOpenVINOModel(modelName, isFP16);
-    ASSERT_FALSE(modelPath.empty()) << modelName;
+
+    OpenVINOModelTestCaseInfo modelInfo = getOpenVINOTestModels().find("age-gender-recognition-retail-0013")->second;
+
+    std::string modelPath = isFP16 ? modelInfo.modelPathFP16 : modelInfo.modelPathFP32;
 
     std::string xmlPath = findDataFile(modelPath + ".xml");
     std::string binPath = findDataFile(modelPath + ".bin");
